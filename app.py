@@ -26,6 +26,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
@@ -283,6 +284,16 @@ def build_event(state: dict, now: datetime) -> dict:
 
 
 # ---------------------------------------------------------------- upstream
+def describe_error(exc: Exception) -> str:
+    """Short, safe description of why the f1-dash call failed (shown in the 503 body)."""
+    path = urlparse(F1DASH_URL).path or "/"
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"HTTP {exc.response.status_code} from {path}"
+    if isinstance(exc, ValueError):
+        return f"non-JSON response from {path}"
+    return f"{type(exc).__name__} calling {path}"
+
+
 class Upstream:
     """Fetch-on-demand with a short cache; keeps serving the last good state briefly on errors."""
 
@@ -307,10 +318,10 @@ class Upstream:
                 resp.raise_for_status()
                 self.state = unwrap_state(resp.json())
                 self.fetched_at = time.monotonic()
-            except (httpx.HTTPError, ValueError) as exc:
+            except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
                 too_old = time.monotonic() - self.fetched_at > STALE_AFTER_S
                 if self.state is None or too_old:
-                    raise HTTPException(503, detail=f"f1-dash unavailable ({type(exc).__name__})")
+                    raise HTTPException(503, detail=f"f1-dash unavailable ({describe_error(exc)})")
             return self.state  # type: ignore[return-value]
 
 
@@ -321,7 +332,7 @@ def create_app(transport: httpx.AsyncBaseTransport | None = None,
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        async with httpx.AsyncClient(transport=transport) as client:
+        async with httpx.AsyncClient(transport=transport, follow_redirects=True) as client:
             app.state.upstream = Upstream(client)
             yield
 
