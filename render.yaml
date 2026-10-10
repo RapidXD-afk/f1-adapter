@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: f1-adapter
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: F1DASH_URL          # full URL of your f1-dash realtime service's /api/current
+        sync: false
+      - key: ADAPTER_API_KEY     # copy this into espn_sports_api_key in nande-rpc.conf
+        generateValue: true
