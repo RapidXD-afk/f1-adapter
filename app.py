@@ -134,7 +134,7 @@ def parse_hms(value: Any) -> float | None:
 def fmt_clock(seconds: int) -> str:
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 def session_kind(info: Any) -> str:
@@ -152,6 +152,44 @@ def session_kind(info: Any) -> str:
     if "practice" in name or typ == "practice":
         return "practice"
     return "other"
+
+
+def session_label(kind: str, info: Any) -> str | None:
+    """Human label used on the details line: 'Race', 'Race Quali', 'Free Practice 2'..."""
+    name = pick(info, "Name")
+    if kind == "race":
+        return "Race"
+    if kind == "qualifying":
+        return "Race Quali"
+    if kind == "sprint":
+        return "Sprint"
+    if kind == "sprint_quali":
+        return "Sprint Quali"
+    if kind == "practice":
+        m = re.search(r"(\d)", str(name or ""))
+        return f"Free Practice {m.group(1)}" if m else "Free Practice"
+    return str(name) if name else None
+
+
+def short_gp(name: str) -> str:
+    return re.sub(r"\bGrand Prix\b", "GP", name).strip()
+
+
+def tyre_letter(state: dict, number: str | None) -> str | None:
+    """First letter of the leader's current compound: S/M/H/I/W (UNKNOWN -> U, ...)."""
+    if number is None:
+        return None
+    entry = pick(pick(pick(state, "TimingAppData"), "Lines"), number)
+    stints = pick(entry, "Stints")
+    if isinstance(stints, dict):  # the raw feed keys stints by index
+        stints = [stints[k] for k in sorted(stints, key=lambda k: int(k) if str(k).isdigit() else -1)]
+    if not isinstance(stints, list):
+        return None
+    for stint in reversed(stints):  # newest stint that actually names a compound
+        compound = pick(stint, "Compound")
+        if isinstance(compound, str) and compound.strip():
+            return compound.strip()[0].upper()
+    return None
 
 
 def session_part(timing: Any) -> int | None:
@@ -218,15 +256,20 @@ def build_event(state: dict, now: datetime) -> dict:
 
     start_local = pick(info, "StartDate")
     year = start_local[:4] if isinstance(start_local, str) and start_local[:4].isdigit() else None
-    gp = pick(pick(info, "Meeting"), "Name") or "Formula 1"
-    name = f"{gp} {year}" if year else gp
+    gp = pick(pick(info, "Meeting"), "Name")
+    label = session_label(kind, info)
+    # Details line: "Singapore GP Race Quali" (no year; session type spelled out).
+    name = " ".join(x for x in (short_gp(gp) if gp else None, label) if x) or "Formula 1"
     session_name = pick(info, "Name")
 
     part = session_part(timing)
     part_label = f"{'SQ' if kind == 'sprint_quali' else 'Q'}{part}" if kind in QUALI_KINDS and part else None
+    if kind == "practice":
+        m = re.search(r"(\d)", str(session_name or ""))
+        part_label = f"FP{m.group(1)}" if m else "FP"
 
     # Leader: race/sprint show their last completed lap; everything else shows best lap.
-    leader_name = leader_team = leader_time = None
+    leader_name = leader_team = leader_time = leader_tyre = None
     if live:
         number, line = find_leader(timing)
         if line is not None:
@@ -234,6 +277,7 @@ def build_event(state: dict, now: datetime) -> dict:
             leader_name = (pick(driver, "FullName") or pick(driver, "BroadcastName")
                            or pick(driver, "Tla"))
             leader_team = pick(driver, "TeamName")
+            leader_tyre = tyre_letter(state, number)
             key = "LastLapTime" if kind in RACE_KINDS else "BestLapTime"
             leader_time = pick(pick(line, key), "Value") or None
 
@@ -248,8 +292,11 @@ def build_event(state: dict, now: datetime) -> dict:
 
     track_status = None
     if live:
-        code = str(pick(pick(state, "TrackStatus"), "Status", default=""))
-        track_status = TRACK_FLAGS.get(code) or ("Chequered Flag" if status_raw == "Finished" else None)
+        if status_raw == "Finished":  # chequered flag beats any marshal yellows after the finish
+            track_status = "Chequered Flag"
+        else:
+            code = str(pick(pick(state, "TrackStatus"), "Status", default=""))
+            track_status = TRACK_FLAGS.get(code)
 
     # Ends the pick in the script, so be conservative: only once results are final, and
     # not between qualifying parts (Q1/Q2 can be "Finalised"-looking before Q3 starts).
@@ -257,7 +304,7 @@ def build_event(state: dict, now: datetime) -> dict:
     if completed and kind in QUALI_KINDS and part not in (None, 3):
         completed = False
 
-    status_text = (f"{session_name} ({STATUS_TEXT[st]})" if session_name else "Waiting for session")
+    status_text = (f"{label or session_name} ({STATUS_TEXT[st]})" if session_name else "Waiting for session")
     return {
         "event_id": EVENT_ID,
         "competition_id": COMPETITION_ID,
@@ -277,6 +324,7 @@ def build_event(state: dict, now: datetime) -> dict:
         "f1_time_remaining_seconds": remaining_s,
         "f1_leader_name": leader_name,
         "f1_leader_team": leader_team,
+        "f1_leader_tyre": leader_tyre,
         "f1_leader_laps": laps,
         "f1_total_laps": total_laps,
         "f1_leader_lap_time": leader_time,
