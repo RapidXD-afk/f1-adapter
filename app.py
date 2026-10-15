@@ -43,6 +43,9 @@ STALE_AFTER_S = float(os.getenv("STALE_AFTER_S", "20"))    # serve last good sta
 COLD_START_TIMEOUT_S = float(os.getenv("COLD_START_TIMEOUT_S", "40"))  # Render free-tier wake-up
 WARM_TIMEOUT_S = float(os.getenv("WARM_TIMEOUT_S", "5"))
 HEARTBEAT_MAX_AGE_S = float(os.getenv("HEARTBEAT_MAX_AGE_S", "45"))
+# Test mode: serve a fake live race that loops through every flag, so the whole chain
+# (adapter -> mpv -> Discord) can be checked without a live session. Off by default.
+SIMULATE = os.getenv("F1_SIMULATE", "0") == "1"
 SHOW_RACE_CLOCK = os.getenv("SHOW_RACE_CLOCK", "0") == "1"  # race/sprint show laps, not the 2h limit
 
 COMPETITION_ID = "f1"
@@ -65,6 +68,18 @@ TRACK_FLAGS = {
     "5": "Red Flag",
     "6": "Virtual Safety Car",
     "7": "VSC Ending",
+}
+
+# Same flags by F1's own name, used if the numeric code is missing or unfamiliar.
+TRACK_BY_NAME = {
+    "yellow": "Yellow Flag",
+    "doubleyellow": "Yellow Flag",
+    "scdeployed": "Safety Car",
+    "safetycar": "Safety Car",
+    "red": "Red Flag",
+    "redflag": "Red Flag",
+    "vscdeployed": "Virtual Safety Car",
+    "vscending": "VSC Ending",
 }
 
 QUALI_KINDS = ("qualifying", "sprint_quali")
@@ -230,6 +245,32 @@ def find_leader(timing: Any) -> tuple[str | None, dict | None]:
     return (best[1], best[2]) if best else (None, None)
 
 
+def _flag_key(value: Any) -> str:
+    return re.sub(r"[^a-z]", "", str(value or "").lower())
+
+
+def current_flag(state: dict) -> str | None:
+    """Current track flag: Yellow Flag / Safety Car / Red Flag / Virtual Safety Car / VSC Ending.
+
+    Primary source is the TrackStatus topic. If that gives nothing (empty, unfamiliar or stuck
+    on AllClear), fall back to the newest TrackStatus change recorded in SessionData.StatusSeries,
+    which F1 sends as a separate topic.
+    """
+    ts = pick(state, "TrackStatus")
+    flag = TRACK_FLAGS.get(str(pick(ts, "Status", default=""))) or TRACK_BY_NAME.get(_flag_key(pick(ts, "Message")))
+    if flag:
+        return flag
+    series = pick(pick(state, "SessionData"), "StatusSeries")
+    if isinstance(series, dict):  # the raw feed keys list entries by index
+        series = list(series.values())
+    newest: tuple[datetime, str] | None = None
+    for entry in series if isinstance(series, list) else []:
+        name, at = pick(entry, "TrackStatus"), parse_ts(pick(entry, "Utc"))
+        if name is not None and at is not None and (newest is None or at >= newest[0]):
+            newest = (at, str(name))
+    return TRACK_BY_NAME.get(_flag_key(newest[1])) if newest else None
+
+
 def clock_remaining(state: dict, now: datetime) -> int | None:
     clock = pick(state, "ExtrapolatedClock")
     base = parse_hms(pick(clock, "Remaining"))
@@ -295,8 +336,7 @@ def build_event(state: dict, now: datetime) -> dict:
         if status_raw == "Finished":  # chequered flag beats any marshal yellows after the finish
             track_status = "Chequered Flag"
         else:
-            code = str(pick(pick(state, "TrackStatus"), "Status", default=""))
-            track_status = TRACK_FLAGS.get(code)
+            track_status = current_flag(state)
 
     # Ends the pick in the script, so be conservative: only once results are final, and
     # not between qualifying parts (Q1/Q2 can be "Finalised"-looking before Q3 starts).
@@ -331,6 +371,39 @@ def build_event(state: dict, now: datetime) -> dict:
     }
 
 
+# ---------------------------------------------------------------- test mode
+# One 150s loop: (start_second, TrackStatus code, name)
+_SIM_FLAGS = [
+    (0, "1", "AllClear"), (15, "2", "Yellow"), (30, "1", "AllClear"),
+    (40, "6", "VSCDeployed"), (70, "7", "VSCEnding"), (80, "1", "AllClear"),
+    (95, "4", "SCDeployed"), (115, "5", "Red"), (130, "1", "AllClear"),
+]
+_SIM_LOOP_S = 150
+
+
+def simulated_state(now: datetime) -> dict:
+    """A fake live Sprint-length race that replays every kind of flag in a loop."""
+    t = int(now.timestamp())
+    phase = t % _SIM_LOOP_S
+    code, name = next((c, n) for start, c, n in reversed(_SIM_FLAGS) if phase >= start)[0:2]
+    lap = 1 + (t // 20) % 62
+    tyre = ("SOFT", "MEDIUM", "HARD")[(t // 60) % 3]
+    lap_time = f"1:3{(t // 20) % 10}.{(t * 7) % 1000:03d}"
+    stamp = now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return {
+        "Heartbeat": {"Utc": stamp},
+        "SessionInfo": {"Meeting": {"Name": "Simulated Grand Prix"}, "Name": "Race", "Type": "Race",
+                        "StartDate": stamp[:19], "GmtOffset": "00:00:00"},
+        "SessionStatus": {"Status": "Started"},
+        "TrackStatus": {"Status": code, "Message": name},
+        "LapCount": {"CurrentLap": lap, "TotalLaps": 62},
+        "DriverList": {"3": {"RacingNumber": "3", "FullName": "Max VERSTAPPEN", "TeamName": "Red Bull Racing"}},
+        "TimingData": {"Lines": {"3": {"Position": "1", "RacingNumber": "3",
+                                       "LastLapTime": {"Value": lap_time}}}},
+        "TimingAppData": {"Lines": {"3": {"RacingNumber": "3", "Stints": [{"Compound": tyre}]}}},
+    }
+
+
 # ---------------------------------------------------------------- upstream
 def describe_error(exc: Exception) -> str:
     """Short, safe description of why the f1-dash call failed (shown in the 503 body)."""
@@ -355,6 +428,8 @@ class Upstream:
         return self.state is not None and time.monotonic() - self.fetched_at < CACHE_TTL_S
 
     async def get(self) -> dict:
+        if SIMULATE:
+            return simulated_state(datetime.now(timezone.utc))
         if self._fresh():
             return self.state  # type: ignore[return-value]
         async with self.lock:
@@ -397,7 +472,7 @@ def create_app(transport: httpx.AsyncBaseTransport | None = None,
 
     @app.get("/healthz")
     async def healthz():
-        return {"ok": True}
+        return {"ok": True, "simulating": SIMULATE}
 
     @api.get("/sports")
     async def sports():
